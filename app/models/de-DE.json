@@ -26,6 +26,21 @@
           ]
         },
         {
+          "name": "ContinueAudiobookIntent",
+          "slots": [],
+          "samples": [
+            "weiterhören",
+            "hör mein hörbuch weiter",
+            "hör das hörbuch weiter",
+            "mach da weiter wo ich aufgehört habe",
+            "mach weiter wo ich aufgehört habe",
+            "spiel mein letztes hörbuch",
+            "spiel mein hörbuch weiter",
+            "setz mein hörbuch fort",
+            "fahre mit meinem hörbuch fort"
+          ]
+        },
+        {
           "name": "AMAZON.PauseIntent",
           "samples": []
         },

@@ -20,6 +20,8 @@
   "options": {
     "SKILL_HOSTNAME": "",
     "MA_HOSTNAME": "",
+    "MA_API_URL": "",
+    "MA_API_TOKEN": "",
     "APP_USERNAME": "",
     "APP_PASSWORD": "",
     "PORT": 5000,
@@ -31,6 +33,8 @@
   "schema": {
     "SKILL_HOSTNAME": "str",
     "MA_HOSTNAME": "str",
+    "MA_API_URL": "str?",
+    "MA_API_TOKEN": "password?",
     "APP_USERNAME": "str",
     "APP_PASSWORD": "str",
     "PORT": "int",

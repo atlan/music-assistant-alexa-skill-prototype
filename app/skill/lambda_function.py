@@ -3,6 +3,8 @@
 import logging
 import gettext
 import os
+import time
+import requests
 from ask_sdk.standard import StandardSkillBuilder
 from ask_sdk_core.dispatch_components import (
     AbstractRequestHandler, AbstractExceptionHandler,
@@ -10,8 +12,9 @@ from ask_sdk_core.dispatch_components import (
 from ask_sdk_core.utils import is_request_type, is_intent_name
 from ask_sdk_core.handler_input import HandlerInput
 from ask_sdk_model import Response
+from env_secrets import get_env_secret
 
-from . import data, util
+from . import data, util, ma_client, device_registry
 
 sb = StandardSkillBuilder()
 # sb = StandardSkillBuilder(
@@ -184,6 +187,129 @@ class LaunchRequestOrPlayAudioHandler(AbstractRequestHandler):
             url=url,
             offset=0,
             text=data.WELCOME_MSG,
+            response_builder=handler_input.response_builder,
+            supports_apl=supports_apl
+        )
+
+
+def _poll_for_new_stream_url(before_version, timeout=6, interval=0.5):
+    """Poll our own /ma/latest-url until its version changes from before_version.
+
+    Deliberately bypasses data.get_latest()'s module-global _last_version/info
+    cache - that state is shared with every other handler in this process, and
+    piggybacking on it here would race with unrelated requests. Returns the raw
+    (unrewritten) streamUrl, or None on timeout.
+    """
+    port = os.environ.get('PORT')
+    url = f"http://127.0.0.1:{port}/ma/latest-url"
+    auth = None
+    user = get_env_secret('APP_USERNAME')
+    pwd = get_env_secret('APP_PASSWORD')
+    if user and pwd:
+        auth = (user, pwd)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = requests.get(url, auth=auth, timeout=3)
+            if resp.status_code == 200:
+                payload = resp.json()
+                if payload.get('version') != before_version and payload.get('streamUrl'):
+                    return payload['streamUrl']
+        except requests.RequestException:
+            logger.exception('Polling %s failed', url)
+        time.sleep(interval)
+    return None
+
+
+class ContinueAudiobookIntentHandler(AbstractRequestHandler):
+    """Resume the most recently in-progress audiobook/podcast episode.
+
+    Looks up "continue listening" from Music Assistant (which reflects
+    Audiobookshelf's own server-side progress, so this works regardless of
+    which app was used to listen - MA's own UI, AabsPlayer, anything synced
+    to the same Audiobookshelf account) and starts it on whichever MA player
+    is mapped to the Echo that asked, via device_registry.
+    """
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return is_intent_name("ContinueAudiobookIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        logger.info("In ContinueAudiobookIntentHandler")
+
+        device_id = None
+        try:
+            device_id = handler_input.request_envelope.context.system.device.device_id
+        except Exception:
+            logger.exception("Could not read device_id from request")
+
+        device_registry.record_seen(device_id)
+        player_id = device_registry.get_player_id(device_id)
+
+        if not player_id:
+            logger.warning("No Music Assistant player mapped for device_id=%s", device_id)
+            handler_input.response_builder.speak(
+                "Dieses Gerät ist noch nicht eingerichtet. Bitte weise es auf der Setup-Seite "
+                "einem Music-Assistant-Player zu."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        try:
+            items = ma_client.get_in_progress_items(limit=1)
+        except ma_client.MAClientError:
+            logger.exception("Failed to fetch in-progress items from Music Assistant")
+            handler_input.response_builder.speak(
+                "Ich konnte Music Assistant nicht nach deinem letzten Hörbuch fragen."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        if not items:
+            handler_input.response_builder.speak(
+                "Ich habe kein Hörbuch gefunden, das du gerade hörst."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        item = items[0]
+
+        before_version = None
+        try:
+            baseline = requests.get(
+                f"http://127.0.0.1:{os.environ.get('PORT')}/ma/latest-url",
+                auth=(get_env_secret('APP_USERNAME'), get_env_secret('APP_PASSWORD')),
+                timeout=3,
+            )
+            if baseline.status_code == 200:
+                before_version = baseline.json().get('version')
+        except requests.RequestException:
+            pass
+
+        try:
+            ma_client.play_media(queue_id=player_id, uri=item.get('uri'))
+        except ma_client.MAClientError:
+            logger.exception("Failed to start playback via Music Assistant")
+            handler_input.response_builder.speak(
+                "Music Assistant konnte die Wiedergabe nicht starten."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        url = _poll_for_new_stream_url(before_version)
+        if not url:
+            logger.warning("Timed out waiting for Music Assistant to push a stream URL")
+            handler_input.response_builder.speak(
+                "Music Assistant hat die Wiedergabe gestartet, aber ich konnte die Stream-URL "
+                "nicht rechtzeitig abrufen."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        title = item.get('name') or ''
+        text = f"Ich mache weiter mit {title}." if title else "Ich mache weiter."
+
+        return util.play(
+            url=url,
+            offset=0,
+            text=text,
             response_builder=handler_input.response_builder,
             supports_apl=supports_apl
         )
@@ -627,6 +753,20 @@ class APLSupportRequestInterceptor(AbstractRequestInterceptor):
         else:
             supports_apl = False
 
+class DeviceSeenInterceptor(AbstractRequestInterceptor):
+    """Record every device that talks to the skill, for the device-assignment setup page.
+
+    Any request type registers the device - the user doesn't need to say
+    "weiterhören" specifically just to get their Echo listed for assignment.
+    """
+    def process(self, handler_input):
+        try:
+            device_id = handler_input.request_envelope.context.system.device.device_id
+            device_registry.record_seen(device_id)
+        except Exception:
+            logger.exception("Failed to record seen device")
+
+
 class RequestLogger(AbstractRequestInterceptor):
     """Log the alexa requests."""
     def process(self, handler_input):
@@ -706,6 +846,7 @@ class ResponseLogger(AbstractResponseInterceptor):
 sb.add_request_handler(CheckAudioInterfaceHandler())
 sb.add_request_handler(SkillEventHandler())
 sb.add_request_handler(LaunchRequestOrPlayAudioHandler())
+sb.add_request_handler(ContinueAudiobookIntentHandler())
 sb.add_request_handler(PlayCommandHandler())
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(ExceptionEncounteredHandler())
@@ -729,6 +870,7 @@ sb.add_exception_handler(CatchAllExceptionHandler())
 
 # Interceptors
 sb.add_global_request_interceptor(APLSupportRequestInterceptor())
+sb.add_global_request_interceptor(DeviceSeenInterceptor())
 sb.add_global_request_interceptor(RequestLogger())
 sb.add_global_request_interceptor(LocalizationInterceptor())
 sb.add_global_response_interceptor(ResponseLogger())

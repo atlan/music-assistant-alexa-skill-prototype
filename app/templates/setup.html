@@ -18,6 +18,18 @@
         <pre id="setup-logs" tabindex="0" style="max-height:300px;overflow:auto;background:#f6f6f6;padding:8px"></pre>
         <div style="margin-top:8px"><button id="download-logs">Download logs</button></div>
     </div>
+
+    <div style="margin-top:24px;border-top:1px solid #ccc;padding-top:16px">
+        <h2 style="font-size:1.1em">"Weiterhören"-Geräte</h2>
+        <p style="color:#666;font-size:0.9em">
+            Alexa verrät einem Skill nie, welches Echo konkret gefragt hat - sag einmal irgendetwas
+            zu einem neuen Echo (z.B. "Alexa, öffne mein Radio"), dann taucht es hier auf und du
+            kannst ihm einen Music-Assistant-Player zuweisen.
+        </p>
+        <div id="devices-unknown"><span style="color:#666">Lade...</span></div>
+        <div id="devices-mapped" style="margin-top:12px"></div>
+    </div>
+
     <script>
     const initialLogs = __INITIAL_LOGS__;
     const initialAuth = __INITIAL_AUTH__;
@@ -138,6 +150,89 @@
         });
 
         renderInitial();
+    })();
+
+    (function(){
+        const unknownEl = document.getElementById('devices-unknown');
+        const mappedEl = document.getElementById('devices-mapped');
+
+        function escapeHtml(s){
+            const d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+
+        function playerOptions(players, selected){
+            let html = '<option value="">Player wählen…</option>';
+            players.forEach(p => {
+                const sel = p.player_id === selected ? ' selected' : '';
+                html += `<option value="${escapeHtml(p.player_id)}"${sel}>${escapeHtml(p.name || p.player_id)}</option>`;
+            });
+            return html;
+        }
+
+        function renderDevices(data){
+            const players = data.players || [];
+
+            if(!data.unknown || data.unknown.length === 0){
+                unknownEl.innerHTML = '<span style="color:#666">Keine neuen Geräte gesehen.</span>';
+            } else {
+                unknownEl.innerHTML = data.unknown.map(d => `
+                    <div style="margin:6px 0;display:flex;align-items:center;gap:8px" data-device="${escapeHtml(d.device_id)}">
+                        <code style="font-size:0.8em;color:#888">${escapeHtml(d.device_id.slice(0, 12))}…</code>
+                        <select class="assign-select">${playerOptions(players, '')}</select>
+                        <button class="assign-btn">Zuweisen</button>
+                    </div>
+                `).join('');
+            }
+
+            if(!data.mapped || data.mapped.length === 0){
+                mappedEl.innerHTML = '';
+            } else {
+                mappedEl.innerHTML = '<div style="font-weight:600;margin-bottom:4px">Zugewiesen</div>' +
+                    data.mapped.map(d => `
+                        <div style="margin:6px 0;display:flex;align-items:center;gap:8px" data-device="${escapeHtml(d.device_id)}">
+                            <code style="font-size:0.8em;color:#888">${escapeHtml(d.device_id.slice(0, 12))}…</code>
+                            <span>→ ${escapeHtml(d.player_name)}</span>
+                            <button class="unassign-btn">Entfernen</button>
+                        </div>
+                    `).join('');
+            }
+        }
+
+        function loadDevices(){
+            fetch('setup/devices').then(r => r.json()).then(renderDevices).catch(() => {
+                unknownEl.innerHTML = '<span style="color:#c00">Geräteliste konnte nicht geladen werden.</span>';
+            });
+        }
+
+        document.addEventListener('click', function(e){
+            const row = e.target.closest('[data-device]');
+            if(!row) return;
+            const deviceId = row.getAttribute('data-device');
+
+            if(e.target.classList.contains('assign-btn')){
+                const select = row.querySelector('.assign-select');
+                const playerId = select ? select.value : '';
+                if(!playerId) return;
+                fetch('setup/devices/assign', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device_id: deviceId, player_id: playerId})
+                }).then(() => loadDevices());
+            }
+
+            if(e.target.classList.contains('unassign-btn')){
+                fetch('setup/devices/unassign', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device_id: deviceId})
+                }).then(() => loadDevices());
+            }
+        });
+
+        loadDevices();
+        setInterval(loadDevices, 15000);
     })();
     </script>
 </body>

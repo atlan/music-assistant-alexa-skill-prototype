@@ -2,6 +2,7 @@ import os
 from flask import Flask, request, jsonify, Response, g, redirect
 from flask_ask_sdk.skill_adapter import SkillAdapter
 from skill.lambda_function import sb  # sb is the SkillBuilder from skill/lambda_function.py
+from skill import device_registry, ma_client
 import json
 import music_assistant_api as ma_api
 import alexa_api as alexa_api
@@ -49,7 +50,7 @@ def _load_addon_options_into_env():
 
 def _safe_options_for_log(options):
     redacted = {}
-    secret_keys = {'APP_USERNAME', 'APP_PASSWORD'}
+    secret_keys = {'APP_USERNAME', 'APP_PASSWORD', 'MA_API_TOKEN'}
     for key, value in options.items():
         if key in secret_keys:
             redacted[key] = 'set' if value else ''
@@ -754,6 +755,70 @@ def setup_stop():
             pass
         _setup_proc = None
     return jsonify({'status':'stopped'})
+
+
+@app.route('/setup/devices', methods=['GET'])
+def setup_devices():
+    """List devices seen but not yet mapped to an MA player, already-mapped
+    devices, and the current MA player list - for the "continue audiobook"
+    device-assignment UI on the setup page.
+    """
+    try:
+        players = ma_client.list_players()
+    except ma_client.MAClientError as e:
+        app.logger.warning('Could not list Music Assistant players: %s', e)
+        players = []
+
+    player_names = {}
+    for p in players:
+        pid = p.get('player_id')
+        if pid:
+            player_names[pid] = p.get('name') or pid
+
+    unknown = [
+        {'device_id': device_id, **meta}
+        for device_id, meta in device_registry.list_unknown().items()
+    ]
+    unknown.sort(key=lambda d: d.get('last_seen', 0), reverse=True)
+
+    mapped = [
+        {
+            'device_id': device_id,
+            'player_id': player_id,
+            'player_name': player_names.get(player_id, player_id),
+        }
+        for device_id, player_id in device_registry.list_mapped().items()
+    ]
+
+    return jsonify({
+        'unknown': unknown,
+        'mapped': mapped,
+        'players': [
+            {'player_id': p.get('player_id'), 'name': p.get('name')}
+            for p in players if p.get('player_id')
+        ],
+    })
+
+
+@app.route('/setup/devices/assign', methods=['POST'])
+def setup_devices_assign():
+    payload = request.get_json(silent=True) or {}
+    device_id = payload.get('device_id')
+    player_id = payload.get('player_id')
+    if not device_id or not player_id:
+        return jsonify({'error': 'device_id and player_id are required'}), 400
+    device_registry.set_mapping(device_id, player_id)
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/setup/devices/unassign', methods=['POST'])
+def setup_devices_unassign():
+    payload = request.get_json(silent=True) or {}
+    device_id = payload.get('device_id')
+    if not device_id:
+        return jsonify({'error': 'device_id is required'}), 400
+    device_registry.remove_mapping(device_id)
+    return jsonify({'status': 'ok'})
 
 
 if __name__ == "__main__":
