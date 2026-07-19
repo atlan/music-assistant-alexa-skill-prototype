@@ -366,6 +366,20 @@ class PlaySearchIntentHandler(AbstractRequestHandler):
             ).set_should_end_session(True)
             return handler_input.response_builder.response
 
+        if query.strip().casefold() == 'audio':
+            # Music Assistant's "alexa" player provider has no direct push API to
+            # the device: to actually start playback after play_media(), it wakes
+            # the skill by injecting a canned voice command ("sag music assistant
+            # spiele audio" - see providers.alexa's play_audio_de-DE template).
+            # That's exactly what the PlayAudio intent (bare "spiele") exists to
+            # catch, but AMAZON.SearchQuery's free-text matching means this more
+            # specific "spiele {SearchQuery}" utterance intercepts it first. Treat
+            # it as PlayAudio - play whatever MA already queued - instead of
+            # starting a *new* search, or every play_media call re-triggers this
+            # same wake phrase forever.
+            logger.info("SearchQuery is Music Assistant's own playback wake phrase, not a real query")
+            return LaunchRequestOrPlayAudioHandler().handle(handler_input)
+
         try:
             results = ma_client.search(query)
         except ma_client.MAClientError:
