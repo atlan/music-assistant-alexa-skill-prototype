@@ -112,6 +112,12 @@ class BasicAuthMiddleware:
         self.app = app
 
     def __call__(self, environ, start_response):
+        # See the matching comment on _check_app_basic_auth: requests proxied
+        # through HA's ingress are already authenticated by HA itself, and
+        # browsers won't show a Basic Auth prompt inside the nested iframe
+        # HA uses to embed ingress pages.
+        if environ.get('HTTP_X_INGRESS_PATH'):
+            return self.app(environ, start_response)
         user = get_env_secret('APP_USERNAME')
         pwd = get_env_secret('APP_PASSWORD')
         if not user and not pwd:
@@ -176,6 +182,15 @@ except Exception:
 def _check_app_basic_auth():
     # Allow the Alexa skill POST endpoint to be called without app-level auth
     if request.path == '/' and request.method == 'POST':
+        return None
+    # Requests proxied through Home Assistant's ingress have already been
+    # authenticated by HA itself (ingress is admin-only) - Supervisor sets
+    # X-Ingress-Path on every request it proxies. Browsers don't show the
+    # native Basic Auth prompt inside a nested iframe (which is how HA embeds
+    # ingress pages), so enforcing our own auth here would just show a raw
+    # "Access denied" body with no way to log in. The publicly-reachable
+    # SKILL_HOSTNAME path never carries this header, so it stays protected.
+    if request.headers.get('X-Ingress-Path'):
         return None
     # Read credentials from secrets (APP_USERNAME/APP_PASSWORD)
     app_user = get_env_secret('APP_USERNAME')
