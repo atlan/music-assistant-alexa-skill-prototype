@@ -41,6 +41,21 @@
           ]
         },
         {
+          "name": "PlaySearchIntent",
+          "slots": [
+            {
+              "name": "SearchQuery",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "samples": [
+            "spiele {SearchQuery}",
+            "spiel {SearchQuery}",
+            "höre {SearchQuery}",
+            "spiele musik von {SearchQuery}"
+          ]
+        },
+        {
           "name": "AMAZON.PauseIntent",
           "samples": []
         },

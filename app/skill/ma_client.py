@@ -3,8 +3,9 @@
 
 Separate from music_assistant_api/ma_routes.py, which is the endpoint MA
 pushes stream URLs *to*. This module lets the skill call back *into* MA
-to look up in-progress audiobooks/podcasts and start playback on a
-specific player queue - needed for the "continue my audiobook" intent.
+to look up in-progress audiobooks/podcasts, search the library (tracks,
+artists, albums - across every connected provider, e.g. Jellyfin), and
+start playback on a specific player queue.
 
 Auth: a long-lived API token generated in MA's own user settings
 (Settings > user profile > API tokens), configured via MA_API_TOKEN.
@@ -79,3 +80,31 @@ def list_players():
     """Return all registered MA players (used to populate the device-assignment UI)."""
     result = call('players/all')
     return result if isinstance(result, list) else []
+
+
+def search(query, media_types=None, limit=5):
+    """Search MA's library across all connected providers. Returns the raw
+    SearchResults dict (keys: artists, albums, genres, tracks, playlists,
+    radio, audiobooks, podcasts), each a list of MediaItems.
+    """
+    args = {'search_query': query, 'limit': limit}
+    if media_types:
+        args['media_types'] = media_types
+    result = call('music/search', args)
+    return result if isinstance(result, dict) else {}
+
+
+def pick_best_match(results):
+    """Pick a single item to play from search() results.
+
+    Prefers a track match (the literal "play this song" interpretation),
+    then an artist match ("play music by X"), then an album match. Returns
+    (item, kind) with kind in {'track', 'artist', 'album'}, or (None, None)
+    if nothing usable was found.
+    """
+    for kind in ('tracks', 'artists', 'albums'):
+        items = results.get(kind) or []
+        for item in items:
+            if item.get('is_playable', True) and item.get('uri'):
+                return item, kind.rstrip('s')
+    return None, None

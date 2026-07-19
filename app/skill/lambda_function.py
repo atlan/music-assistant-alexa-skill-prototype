@@ -222,6 +222,73 @@ def _poll_for_new_stream_url(before_version, timeout=6, interval=0.5):
     return None
 
 
+def _resolve_player_for_device(handler_input):
+    """Record the requesting device as seen and return its mapped MA player_id (or None)."""
+    device_id = None
+    try:
+        device_id = handler_input.request_envelope.context.system.device.device_id
+    except Exception:
+        logger.exception("Could not read device_id from request")
+
+    device_registry.record_seen(device_id)
+    return device_registry.get_player_id(device_id)
+
+
+def _not_set_up_response(handler_input):
+    handler_input.response_builder.speak(
+        "Dieses Gerät ist noch nicht eingerichtet. Bitte weise es auf der Setup-Seite "
+        "einem Music-Assistant-Player zu."
+    ).set_should_end_session(True)
+    return handler_input.response_builder.response
+
+
+def _start_ma_playback_and_respond(handler_input, player_id, uri, success_text):
+    """Ask MA to play uri on player_id, wait for the resulting push, then respond.
+
+    Shared by every intent that starts playback via Music Assistant
+    (continue-audiobook, search-and-play, ...): call player_queues/play_media,
+    poll our own /ma/latest-url for the stream URL MA's "alexa" player
+    provider pushes back as a side effect, then hand it to util.play().
+    """
+    before_version = None
+    try:
+        baseline = requests.get(
+            f"http://127.0.0.1:{os.environ.get('PORT')}/ma/latest-url",
+            auth=(get_env_secret('APP_USERNAME'), get_env_secret('APP_PASSWORD')),
+            timeout=3,
+        )
+        if baseline.status_code == 200:
+            before_version = baseline.json().get('version')
+    except requests.RequestException:
+        pass
+
+    try:
+        ma_client.play_media(queue_id=player_id, uri=uri)
+    except ma_client.MAClientError:
+        logger.exception("Failed to start playback via Music Assistant")
+        handler_input.response_builder.speak(
+            "Music Assistant konnte die Wiedergabe nicht starten."
+        ).set_should_end_session(True)
+        return handler_input.response_builder.response
+
+    url = _poll_for_new_stream_url(before_version)
+    if not url:
+        logger.warning("Timed out waiting for Music Assistant to push a stream URL")
+        handler_input.response_builder.speak(
+            "Music Assistant hat die Wiedergabe gestartet, aber ich konnte die Stream-URL "
+            "nicht rechtzeitig abrufen."
+        ).set_should_end_session(True)
+        return handler_input.response_builder.response
+
+    return util.play(
+        url=url,
+        offset=0,
+        text=success_text,
+        response_builder=handler_input.response_builder,
+        supports_apl=supports_apl
+    )
+
+
 class ContinueAudiobookIntentHandler(AbstractRequestHandler):
     """Resume the most recently in-progress audiobook/podcast episode.
 
@@ -239,22 +306,10 @@ class ContinueAudiobookIntentHandler(AbstractRequestHandler):
         # type: (HandlerInput) -> Response
         logger.info("In ContinueAudiobookIntentHandler")
 
-        device_id = None
-        try:
-            device_id = handler_input.request_envelope.context.system.device.device_id
-        except Exception:
-            logger.exception("Could not read device_id from request")
-
-        device_registry.record_seen(device_id)
-        player_id = device_registry.get_player_id(device_id)
-
+        player_id = _resolve_player_for_device(handler_input)
         if not player_id:
-            logger.warning("No Music Assistant player mapped for device_id=%s", device_id)
-            handler_input.response_builder.speak(
-                "Dieses Gerät ist noch nicht eingerichtet. Bitte weise es auf der Setup-Seite "
-                "einem Music-Assistant-Player zu."
-            ).set_should_end_session(True)
-            return handler_input.response_builder.response
+            logger.warning("No Music Assistant player mapped for this device")
+            return _not_set_up_response(handler_input)
 
         try:
             items = ma_client.get_in_progress_items(limit=1)
@@ -272,47 +327,71 @@ class ContinueAudiobookIntentHandler(AbstractRequestHandler):
             return handler_input.response_builder.response
 
         item = items[0]
-
-        before_version = None
-        try:
-            baseline = requests.get(
-                f"http://127.0.0.1:{os.environ.get('PORT')}/ma/latest-url",
-                auth=(get_env_secret('APP_USERNAME'), get_env_secret('APP_PASSWORD')),
-                timeout=3,
-            )
-            if baseline.status_code == 200:
-                before_version = baseline.json().get('version')
-        except requests.RequestException:
-            pass
-
-        try:
-            ma_client.play_media(queue_id=player_id, uri=item.get('uri'))
-        except ma_client.MAClientError:
-            logger.exception("Failed to start playback via Music Assistant")
-            handler_input.response_builder.speak(
-                "Music Assistant konnte die Wiedergabe nicht starten."
-            ).set_should_end_session(True)
-            return handler_input.response_builder.response
-
-        url = _poll_for_new_stream_url(before_version)
-        if not url:
-            logger.warning("Timed out waiting for Music Assistant to push a stream URL")
-            handler_input.response_builder.speak(
-                "Music Assistant hat die Wiedergabe gestartet, aber ich konnte die Stream-URL "
-                "nicht rechtzeitig abrufen."
-            ).set_should_end_session(True)
-            return handler_input.response_builder.response
-
         title = item.get('name') or ''
         text = f"Ich mache weiter mit {title}." if title else "Ich mache weiter."
 
-        return util.play(
-            url=url,
-            offset=0,
-            text=text,
-            response_builder=handler_input.response_builder,
-            supports_apl=supports_apl
-        )
+        return _start_ma_playback_and_respond(handler_input, player_id, item.get('uri'), text)
+
+
+class PlaySearchIntentHandler(AbstractRequestHandler):
+    """Search Music Assistant's library (tracks, artists, albums - across all
+    connected providers, e.g. Jellyfin) for a free-text query and play the
+    best match on whichever MA player is mapped to the Echo that asked.
+
+    Prefers an exact-ish track match ("spiele Bohemian Rhapsody") over an
+    artist match ("spiele Queen"), then falls back to albums - matching how
+    people naturally ask for either a specific song or "some music by X".
+    """
+    def can_handle(self, handler_input):
+        # type: (HandlerInput) -> bool
+        return is_intent_name("PlaySearchIntent")(handler_input)
+
+    def handle(self, handler_input):
+        # type: (HandlerInput) -> Response
+        logger.info("In PlaySearchIntentHandler")
+
+        player_id = _resolve_player_for_device(handler_input)
+        if not player_id:
+            logger.warning("No Music Assistant player mapped for this device")
+            return _not_set_up_response(handler_input)
+
+        slots = getattr(handler_input.request_envelope.request.intent, 'slots', None) or {}
+        query_slot = slots.get('SearchQuery')
+        query = getattr(query_slot, 'value', None) if query_slot else None
+
+        if not query:
+            handler_input.response_builder.speak(
+                "Ich habe nicht verstanden, was ich spielen soll."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        try:
+            results = ma_client.search(query)
+        except ma_client.MAClientError:
+            logger.exception("Failed to search Music Assistant for %r", query)
+            handler_input.response_builder.speak(
+                "Ich konnte Music Assistant nicht durchsuchen."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        item, kind = ma_client.pick_best_match(results)
+        if not item:
+            handler_input.response_builder.speak(
+                f"Ich habe nichts zu \"{query}\" gefunden."
+            ).set_should_end_session(True)
+            return handler_input.response_builder.response
+
+        name = item.get('name') or query
+        if kind == 'artist':
+            text = f"Ich spiele Musik von {name}."
+        elif kind == 'album':
+            text = f"Ich spiele das Album {name}."
+        else:
+            artists = item.get('artists') or []
+            artist_name = artists[0].get('name') if artists and isinstance(artists[0], dict) else None
+            text = f"Ich spiele {name} von {artist_name}." if artist_name else f"Ich spiele {name}."
+
+        return _start_ma_playback_and_respond(handler_input, player_id, item.get('uri'), text)
 
 
 class HelpIntentHandler(AbstractRequestHandler):
@@ -847,6 +926,7 @@ sb.add_request_handler(CheckAudioInterfaceHandler())
 sb.add_request_handler(SkillEventHandler())
 sb.add_request_handler(LaunchRequestOrPlayAudioHandler())
 sb.add_request_handler(ContinueAudiobookIntentHandler())
+sb.add_request_handler(PlaySearchIntentHandler())
 sb.add_request_handler(PlayCommandHandler())
 sb.add_request_handler(HelpIntentHandler())
 sb.add_request_handler(ExceptionEncounteredHandler())
